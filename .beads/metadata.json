@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "GOFVML",
+  "project_id": "7e2cc337-ae6c-4f30-94b9-a03d90b2b220"
+}
