@@ -53,3 +53,41 @@ func TestRangeAdjacent(t *testing.T) {
 		t.Error("expected not adjacent")
 	}
 }
+
+func TestBlockIsZero(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+		want bool
+	}{
+		{
+			name: "empty",
+			data: []byte{},
+			want: true,
+		},
+		{
+			name: "all_zeros",
+			data: []byte{0, 0, 0, 0},
+			want: true,
+		},
+		{
+			name: "non_zero",
+			data: []byte{0, 0, 1, 0},
+			want: false,
+		},
+		{
+			name: "first_byte_non_zero",
+			data: []byte{1, 0, 0, 0},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := Block{Range: Range{Start: 0, End: uint64(len(tt.data))}, Data: tt.data}
+			if got := b.IsZero(); got != tt.want {
+				t.Errorf("IsZero() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

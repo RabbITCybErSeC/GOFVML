@@ -31,3 +31,21 @@ func (r Range) Overlaps(other Range) bool {
 func (r Range) Adjacent(other Range) bool {
 	return r.End == other.Start || other.End == r.Start
 }
+
+// Block represents a physical memory block with an associated range.
+// The Data field is populated during acquisition and may be omitted
+// for zero-block detection.
+type Block struct {
+	Range Range
+	Data  []byte
+}
+
+// IsZero reports whether the block contains only zero bytes.
+func (b Block) IsZero() bool {
+	for _, v := range b.Data {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
+}
