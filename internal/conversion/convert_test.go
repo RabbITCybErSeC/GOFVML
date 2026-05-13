@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"math"
 	"testing"
 
 	"github.com/RabbITCybErSeC/gofvml/internal/image"
@@ -306,6 +307,21 @@ func TestConvertEncodedToRawDoesNotInventTrailingSkippedZeroExtent(t *testing.T)
 
 	if got, want := output.Bytes(), []byte{1, 2}; !bytes.Equal(got, want) {
 		t.Fatalf("output = %v, want %v", got, want)
+	}
+}
+
+func TestConvertEncodedToRawRejectsHugeSparseGap(t *testing.T) {
+	var input bytes.Buffer
+	h := image.NewLiMEHeader(uint64(math.MaxInt64)+1, uint64(math.MaxInt64)+2)
+	h.Encode(&input)
+	input.Write([]byte{1})
+
+	_, err := Convert(context.Background(), &input, io.Discard, Options{
+		SourceFormat: FormatLiME,
+		TargetFormat: FormatRaw,
+	})
+	if err == nil {
+		t.Fatal("expected error for sparse gap too large to materialize")
 	}
 }
 

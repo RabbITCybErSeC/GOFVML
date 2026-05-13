@@ -226,7 +226,7 @@ func Acquire(ctx context.Context, opts Options) (*Result, error) {
 			WithTarget(opts.OutputPath).
 			WithCause(fmt.Errorf("%d block(s) failed", failures))
 	}
-	if blocksWritten+blocksSkipped == 0 {
+	if blocksWritten == 0 {
 		result.Success = false
 		return result, diagnostic.SourceError("physical acquisition wrote no blocks").
 			WithOperation("physical acquisition").

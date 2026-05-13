@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 
 	"github.com/RabbITCybErSeC/gofvml/internal/diagnostic"
 	"github.com/RabbITCybErSeC/gofvml/internal/image"
@@ -345,6 +346,9 @@ func writeEncodedBlockAsRaw(w io.Writer, currentOffset, start uint64, payload []
 
 	var written int64
 	if gap := start - currentOffset; gap > 0 {
+		if gap > math.MaxInt64 {
+			return 0, currentOffset, fmt.Errorf("encoded block gap %d exceeds maximum raw gap %d", gap, int64(math.MaxInt64))
+		}
 		n, err := io.CopyN(w, zeroReader{}, int64(gap))
 		written += n
 		if err != nil {

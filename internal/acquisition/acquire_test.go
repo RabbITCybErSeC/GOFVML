@@ -362,6 +362,39 @@ func TestAcquireAllWriteFailuresReturnError(t *testing.T) {
 	}
 }
 
+func TestAcquireAllZeroSkippedBlocksReturnError(t *testing.T) {
+	data := make([]byte, 4)
+	fake := source.NewFakeSource(data, 0x1000)
+	var output bufferWriteCloser
+
+	result, err := Acquire(context.Background(), Options{
+		OutputPath:     "memory.lime",
+		Format:         "lime",
+		Ranges:         []phys.Range{{Start: 0x1000, End: 0x1004}},
+		SkipZeroBlocks: true,
+		Sources:        []source.Source{source.NewFakeSourceAdapter(fake)},
+		Output:         &output,
+	})
+	if err == nil {
+		t.Fatal("expected acquisition error")
+	}
+	if result == nil {
+		t.Fatal("expected partial result")
+	}
+	if result.Success {
+		t.Error("expected unsuccessful result")
+	}
+	if result.BlocksWritten != 0 {
+		t.Errorf("BlocksWritten = %d, want 0", result.BlocksWritten)
+	}
+	if result.BlocksSkipped != 1 {
+		t.Errorf("BlocksSkipped = %d, want 1", result.BlocksSkipped)
+	}
+	if output.Len() != 0 {
+		t.Errorf("output length = %d, want 0", output.Len())
+	}
+}
+
 type bufferWriteCloser struct {
 	bytes.Buffer
 }
