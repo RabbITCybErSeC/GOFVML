@@ -49,6 +49,65 @@ make build-all          # all configured Linux targets for gofvml
 
 The `gofvml-convert` and `gofvml-upload` compatibility binaries remain available for existing automation.
 
+## Examples
+
+Build the main GOFVML binary for the current development machine:
+
+```bash
+make build
+./bin/gofvml help
+```
+
+Build release binaries for specific Linux platforms:
+
+```bash
+make build-linux-amd64
+make build-linux-arm64
+make build-linux-armv7
+```
+
+Acquire physical memory as a LiME image:
+
+```bash
+sudo gofvml physical -output memory.lime -format lime -progress
+```
+
+Acquire physical memory as an AVML-compatible compressed image:
+
+```bash
+sudo gofvml physical -output memory.avml -format avml -skip-zero -progress
+```
+
+Dump selected process memory:
+
+```bash
+sudo gofvml process -pid 1234 -output process.gofvml -max-bytes 268435456 -progress
+```
+
+Convert a raw image to LiME:
+
+```bash
+gofvml convert -input memory.raw -output memory.lime -from raw -to lime -progress
+```
+
+Compress an existing image to AVML-compatible format:
+
+```bash
+gofvml compress -input memory.lime -output memory.avml -from lime -progress
+```
+
+Upload an image with HTTP PUT:
+
+```bash
+gofvml upload -file memory.avml -url https://example.com/upload/memory.avml -retries 3 -progress
+```
+
+Upload and remove the local file after a successful transfer:
+
+```bash
+gofvml upload -file memory.avml -url https://example.com/upload/memory.avml -delete-after
+```
+
 ## Module Path
 
 ```
