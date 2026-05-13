@@ -79,9 +79,34 @@ func (e ReadEvent) IsShortRead() bool {
 	return e.Err == nil && e.Read < e.Requested
 }
 
+type processMemory interface {
+	io.ReaderAt
+	io.Closer
+}
+
+type processFS interface {
+	OpenMem(pid int) (processMemory, error)
+	ReadMaps(pid int) ([]procfs.Mapping, error)
+}
+
+type osProcessFS struct{}
+
+func (osProcessFS) OpenMem(pid int) (processMemory, error) {
+	memPath := filepath.Join("/proc", strconv.Itoa(pid), "mem")
+	return os.OpenFile(memPath, os.O_RDONLY, 0)
+}
+
+func (osProcessFS) ReadMaps(pid int) ([]procfs.Mapping, error) {
+	return procfs.ReadMaps(pid)
+}
+
 // Acquire reads process memory for the given PID according to options.
 // It returns a Result with per-mapping events and any warnings or errors.
 func Acquire(ctx context.Context, opts Options) (*Result, error) {
+	return acquireWithProcFS(ctx, opts, osProcessFS{})
+}
+
+func acquireWithProcFS(ctx context.Context, opts Options, proc processFS) (*Result, error) {
 	if opts.ChunkSize <= 0 {
 		opts.ChunkSize = DefaultChunkSize
 	}
@@ -92,7 +117,7 @@ func Acquire(ctx context.Context, opts Options) (*Result, error) {
 
 	// Open /proc/<pid>/mem read-only.
 	memPath := filepath.Join("/proc", strconv.Itoa(opts.PID), "mem")
-	memFile, err := os.OpenFile(memPath, os.O_RDONLY, 0)
+	memFile, err := proc.OpenMem(opts.PID)
 	if err != nil {
 		d := diagnostic.ProcessError("cannot open process memory").
 			WithTarget(memPath).
@@ -103,7 +128,7 @@ func Acquire(ctx context.Context, opts Options) (*Result, error) {
 	defer memFile.Close()
 
 	// Read process maps.
-	maps, err := procfs.ReadMaps(opts.PID)
+	maps, err := proc.ReadMaps(opts.PID)
 	if err != nil {
 		d := diagnostic.ProcessError("cannot read process maps").
 			WithTarget(strconv.Itoa(opts.PID)).
@@ -165,7 +190,7 @@ func Acquire(ctx context.Context, opts Options) (*Result, error) {
 }
 
 // readMapping reads all chunks from a single mapping.
-func readMapping(ctx context.Context, memFile *os.File, mapping procfs.Mapping, chunkSize int, mr *MappingResult) error {
+func readMapping(ctx context.Context, memFile io.ReaderAt, mapping procfs.Mapping, chunkSize int, mr *MappingResult) error {
 	addr := mapping.Start
 	end := mapping.End
 

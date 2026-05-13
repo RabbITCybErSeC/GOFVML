@@ -3,8 +3,10 @@ package process
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -154,6 +156,103 @@ func TestAcquireInvalidPID(t *testing.T) {
 	}
 }
 
+func TestAcquireNonStrictKeepsSuccessfulBlocksWhenLaterMappingFails(t *testing.T) {
+	readErr := errors.New("input/output error")
+	proc := fakeProcessFS{
+		maps: []procfs.Mapping{
+			{Start: 0x1000, End: 0x1004, Perms: "r--p", Pathname: "[heap]"},
+			{Start: 0x2000, End: 0x2004, Perms: "r--p", Pathname: "[stack]"},
+		},
+		mem: &scriptedMem{
+			reads: map[int64]scriptedRead{
+				0x1000: {data: []byte("MARK")},
+				0x2000: {err: readErr},
+			},
+		},
+	}
+
+	result, err := acquireWithProcFS(context.Background(), Options{
+		PID:       1706,
+		Filter:    DefaultFilter(),
+		ChunkSize: 4,
+		Strict:    false,
+	}, proc)
+	if err != nil {
+		t.Fatalf("Acquire returned error in non-strict mode: %v", err)
+	}
+	if !result.Success {
+		t.Fatal("expected non-strict acquisition to report success after useful reads")
+	}
+	if result.BytesRead != 4 {
+		t.Fatalf("BytesRead = %d, want 4", result.BytesRead)
+	}
+	if len(result.Mappings) != 2 {
+		t.Fatalf("Mappings = %d, want 2", len(result.Mappings))
+	}
+	if got := result.Mappings[0].Blocks; len(got) != 1 || !bytes.Equal(got[0].Data, []byte("MARK")) {
+		t.Fatalf("first mapping blocks = %+v, want MARK payload", got)
+	}
+	if len(result.Warnings) != 1 {
+		t.Fatalf("Warnings = %d, want 1", len(result.Warnings))
+	}
+	warning := result.Warnings[0]
+	if warning.Target != "pid=1706 mapping=2000-2004" {
+		t.Fatalf("warning target = %q, want failed mapping target", warning.Target)
+	}
+	if warning.Cause == nil || !strings.Contains(warning.Cause.Error(), "input/output error") {
+		t.Fatalf("warning cause = %v, want input/output error", warning.Cause)
+	}
+}
+
+func TestAcquireStrictFailsOnFirstMappingError(t *testing.T) {
+	readErr := errors.New("input/output error")
+	proc := fakeProcessFS{
+		maps: []procfs.Mapping{
+			{Start: 0x1000, End: 0x1004, Perms: "r--p", Pathname: "[heap]"},
+			{Start: 0x2000, End: 0x2004, Perms: "r--p", Pathname: "[stack]"},
+			{Start: 0x3000, End: 0x3004, Perms: "r--p", Pathname: "[vdso]"},
+		},
+		mem: &scriptedMem{
+			reads: map[int64]scriptedRead{
+				0x1000: {data: []byte("GOOD")},
+				0x2000: {err: readErr},
+				0x3000: {data: []byte("LATE")},
+			},
+		},
+	}
+
+	result, err := acquireWithProcFS(context.Background(), Options{
+		PID:       1706,
+		Filter:    DefaultFilter(),
+		ChunkSize: 4,
+		Strict:    true,
+	}, proc)
+	if err == nil {
+		t.Fatal("expected strict acquisition to return the mapping read error")
+	}
+	if !strings.Contains(err.Error(), "read mapping chunk at 0x2000") {
+		t.Fatalf("error = %v, want failed mapping address", err)
+	}
+	if result == nil {
+		t.Fatal("expected partial result in strict mode")
+	}
+	if result.Success {
+		t.Fatal("expected strict acquisition result to be unsuccessful")
+	}
+	if result.BytesRead != 4 {
+		t.Fatalf("BytesRead = %d, want successful bytes before failure", result.BytesRead)
+	}
+	if len(result.Mappings) != 2 {
+		t.Fatalf("Mappings = %d, want acquisition to stop at failed mapping", len(result.Mappings))
+	}
+	if len(result.Warnings) != 0 {
+		t.Fatalf("Warnings = %d, want strict mode to return error without warning", len(result.Warnings))
+	}
+	if _, ok := proc.mem.readOffsets[0x3000]; ok {
+		t.Fatal("strict acquisition read a mapping after the first failure")
+	}
+}
+
 func TestAcquireProgressEvents(t *testing.T) {
 	skipIfNotLinux(t)
 	pid := os.Getpid()
@@ -246,6 +345,33 @@ func TestReadMappingCapturesPayloadBlocks(t *testing.T) {
 	}
 }
 
+func TestReadMappingPreservesPartialPayloadWhenReadReturnsBytesAndError(t *testing.T) {
+	mem := &scriptedMem{
+		reads: map[int64]scriptedRead{
+			0x4000: {data: []byte("PART"), err: errors.New("input/output error")},
+		},
+	}
+	mapping := procfs.Mapping{Start: 0x4000, End: 0x4008, Perms: "r--p"}
+	var mr MappingResult
+
+	err := readMapping(context.Background(), mem, mapping, 8, &mr)
+	if err == nil {
+		t.Fatal("expected readMapping error")
+	}
+	if mr.BytesRead != 4 {
+		t.Fatalf("BytesRead = %d, want partial bytes", mr.BytesRead)
+	}
+	if len(mr.Blocks) != 1 {
+		t.Fatalf("Blocks = %d, want one partial block", len(mr.Blocks))
+	}
+	if got := mr.Blocks[0].Data; !bytes.Equal(got, []byte("PART")) {
+		t.Fatalf("partial payload = %q, want PART", got)
+	}
+	if mr.Blocks[0].Status != StatusError {
+		t.Fatalf("partial block status = %d, want StatusError", mr.Blocks[0].Status)
+	}
+}
+
 func TestReadMappingReturnsErrorOnFailedChunk(t *testing.T) {
 	tmp := t.TempDir()
 	path := tmp + "/short-mem"
@@ -312,4 +438,49 @@ func TestAcquireNoMappings(t *testing.T) {
 	if len(result.Warnings) == 0 {
 		t.Error("expected warning for no mappings selected")
 	}
+}
+
+type fakeProcessFS struct {
+	maps    []procfs.Mapping
+	mem     *scriptedMem
+	openErr error
+	mapsErr error
+}
+
+func (f fakeProcessFS) OpenMem(pid int) (processMemory, error) {
+	if f.openErr != nil {
+		return nil, f.openErr
+	}
+	return f.mem, nil
+}
+
+func (f fakeProcessFS) ReadMaps(pid int) ([]procfs.Mapping, error) {
+	if f.mapsErr != nil {
+		return nil, f.mapsErr
+	}
+	return f.maps, nil
+}
+
+type scriptedRead struct {
+	data []byte
+	err  error
+}
+
+type scriptedMem struct {
+	reads       map[int64]scriptedRead
+	readOffsets map[int64]bool
+}
+
+func (m *scriptedMem) ReadAt(p []byte, off int64) (int, error) {
+	if m.readOffsets == nil {
+		m.readOffsets = make(map[int64]bool)
+	}
+	m.readOffsets[off] = true
+	read := m.reads[off]
+	n := copy(p, read.data)
+	return n, read.err
+}
+
+func (m *scriptedMem) Close() error {
+	return nil
 }
