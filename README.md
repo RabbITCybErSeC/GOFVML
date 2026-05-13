@@ -49,4 +49,4 @@ This project is under active development. See `openspec/changes/define-dedicated
 
 ## License
 
-[License TBD]
+MIT. See [LICENSE](LICENSE).

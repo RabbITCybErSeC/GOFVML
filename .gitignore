@@ -2,6 +2,8 @@
 /gofvml
 /gofvml-convert
 /gofvml-upload
+/bin/
+/dist/
 *.exe
 
 # Go build artifacts
