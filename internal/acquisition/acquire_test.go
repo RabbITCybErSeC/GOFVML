@@ -3,11 +3,13 @@ package acquisition
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 
+	"github.com/RabbITCybErSeC/gofvml/internal/diagnostic"
 	"github.com/RabbITCybErSeC/gofvml/internal/image"
 	"github.com/RabbITCybErSeC/gofvml/internal/phys"
 	"github.com/RabbITCybErSeC/gofvml/internal/progress"
@@ -91,6 +93,41 @@ func TestAcquireAVML(t *testing.T) {
 	}
 	if !bytes.Equal(decodedData, data) {
 		t.Errorf("data mismatch: got %v, want %v", decodedData, data)
+	}
+}
+
+func TestAcquireAVMLSplitsLargeBlocks(t *testing.T) {
+	data := bytes.Repeat([]byte{0x7b}, image.AVMLBlockSize+2)
+	var output bytes.Buffer
+
+	block := phys.Block{
+		Range: phys.Range{Start: 0x1000, End: 0x1000 + uint64(len(data))},
+		Data:  data,
+	}
+	if _, err := writeAVMLBlock(&output, block); err != nil {
+		t.Fatalf("writeAVMLBlock error: %v", err)
+	}
+
+	r := bytes.NewReader(output.Bytes())
+	header1, payload1, err := image.DecodeAVMLBlock(r)
+	if err != nil {
+		t.Fatalf("DecodeAVMLBlock first error: %v", err)
+	}
+	header2, payload2, err := image.DecodeAVMLBlock(r)
+	if err != nil {
+		t.Fatalf("DecodeAVMLBlock second error: %v", err)
+	}
+	if r.Len() != 0 {
+		t.Fatalf("unexpected trailing bytes: %d", r.Len())
+	}
+	if header1.Start != 0x1000 || header1.RangeLen() != image.AVMLBlockSize {
+		t.Fatalf("first block range = 0x%x len %d", header1.Start, header1.RangeLen())
+	}
+	if header2.Start != 0x1000+image.AVMLBlockSize || header2.RangeLen() != 2 {
+		t.Fatalf("second block range = 0x%x len %d", header2.Start, header2.RangeLen())
+	}
+	if !bytes.Equal(append(payload1, payload2...), data) {
+		t.Fatal("split payloads do not reconstruct original data")
 	}
 }
 
@@ -237,11 +274,26 @@ func TestAcquireWithFakeSource(t *testing.T) {
 	fake := source.NewFakeSource(data, 0x1000)
 	adapter := source.NewFakeSourceAdapter(fake)
 
-	// We can't easily inject the fake source into Acquire because it uses
-	// DefaultSources(). Instead, let's test the individual components.
-	_ = adapter
+	var output bufferWriteCloser
+	result, err := Acquire(context.Background(), Options{
+		OutputPath: "memory.lime",
+		Format:     "lime",
+		Ranges:     []phys.Range{{Start: 0x1000, End: 0x1008}},
+		Sources:    []source.Source{adapter},
+		Output:     &output,
+	})
+	if err != nil {
+		t.Fatalf("Acquire error: %v", err)
+	}
+	if !result.Success {
+		t.Error("expected success")
+	}
+	if result.BlocksWritten != 1 {
+		t.Fatalf("BlocksWritten = %d, want 1", result.BlocksWritten)
+	}
 
-	// Test that ReadBlock works with fake source.
+	// Test that ReadBlock works with a fake source.
+	fake = source.NewFakeSource(data, 0x1000)
 	block := phys.Block{Range: phys.Range{Start: 0x1000, End: 0x1008}}
 	readBlock, err := source.ReadBlock(fake, block)
 	if err != nil {
@@ -255,4 +307,105 @@ func TestAcquireWithFakeSource(t *testing.T) {
 			t.Errorf("byte[%d] = %d, want %d", i, readBlock.Data[i], want)
 		}
 	}
+}
+
+func TestAcquireAllReadFailuresReturnError(t *testing.T) {
+	var output bufferWriteCloser
+	result, err := Acquire(context.Background(), Options{
+		OutputPath: "memory.lime",
+		Format:     "lime",
+		Ranges:     []phys.Range{{Start: 0x1000, End: 0x1008}},
+		Sources:    []source.Source{testSource{reader: failingReader{err: fmt.Errorf("read boom")}}},
+		Output:     &output,
+	})
+	if err == nil {
+		t.Fatal("expected acquisition error")
+	}
+	if result == nil {
+		t.Fatal("expected partial result")
+	}
+	if result.Success {
+		t.Error("expected unsuccessful result")
+	}
+	if result.BlocksWritten != 0 {
+		t.Errorf("BlocksWritten = %d, want 0", result.BlocksWritten)
+	}
+	if len(result.Warnings) != 1 {
+		t.Errorf("warnings = %d, want 1", len(result.Warnings))
+	}
+}
+
+func TestAcquireAllWriteFailuresReturnError(t *testing.T) {
+	data := []byte{1, 2, 3, 4}
+	fake := source.NewFakeSource(data, 0x1000)
+	result, err := Acquire(context.Background(), Options{
+		OutputPath: "memory.lime",
+		Format:     "lime",
+		Ranges:     []phys.Range{{Start: 0x1000, End: 0x1004}},
+		Sources:    []source.Source{source.NewFakeSourceAdapter(fake)},
+		Output:     failingWriteCloser{err: fmt.Errorf("write boom")},
+	})
+	if err == nil {
+		t.Fatal("expected acquisition error")
+	}
+	if result == nil {
+		t.Fatal("expected partial result")
+	}
+	if result.Success {
+		t.Error("expected unsuccessful result")
+	}
+	if result.BlocksWritten != 0 {
+		t.Errorf("BlocksWritten = %d, want 0", result.BlocksWritten)
+	}
+	if len(result.Warnings) != 1 {
+		t.Errorf("warnings = %d, want 1", len(result.Warnings))
+	}
+}
+
+type bufferWriteCloser struct {
+	bytes.Buffer
+}
+
+func (b *bufferWriteCloser) Close() error {
+	return nil
+}
+
+type failingWriteCloser struct {
+	err error
+}
+
+func (f failingWriteCloser) Write([]byte) (int, error) {
+	return 0, f.err
+}
+
+func (f failingWriteCloser) Close() error {
+	return nil
+}
+
+type failingReader struct {
+	err error
+}
+
+func (f failingReader) ReadAt([]byte, uint64) (int, error) {
+	return 0, f.err
+}
+
+func (f failingReader) Close() error {
+	return nil
+}
+
+type testSource struct {
+	reader source.Reader
+}
+
+func (t testSource) Info() source.Info {
+	return source.Info{Name: "test", Path: "test://source"}
+}
+
+func (t testSource) Check(context.Context) source.Availability {
+	return source.Availability{Available: true, Path: "test://source"}
+}
+
+func (t testSource) Open(context.Context) (source.Reader, *diagnostic.Diagnostic) {
+	return t.reader, nil
 }

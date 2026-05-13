@@ -103,7 +103,7 @@ func TestLiMEHeaderReversedRange(t *testing.T) {
 	binary.Write(&buf, binary.LittleEndian, uint32(LiMEVersion))
 	binary.Write(&buf, binary.LittleEndian, uint64(0x2000))
 	binary.Write(&buf, binary.LittleEndian, uint64(0x1000)) // end < start
-	buf.Write(make([]byte, 8)) // padding
+	buf.Write(make([]byte, 8))                              // padding
 
 	_, err := DecodeLiMEHeader(&buf)
 	if err == nil {
@@ -200,6 +200,32 @@ func TestAVMLBlockRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(decodedData, data) {
 		t.Errorf("data mismatch: got %q, want %q", decodedData, data)
+	}
+}
+
+func TestAVMLBlockLayoutUsesSnappyFrameAndEOFLengthTrailer(t *testing.T) {
+	data := []byte("snappy framed payload")
+	header := NewAVMLHeader(0x1000, 0x1000+uint64(len(data)))
+
+	var buf bytes.Buffer
+	if err := EncodeAVMLBlock(&buf, header, data); err != nil {
+		t.Fatalf("EncodeAVMLBlock error: %v", err)
+	}
+
+	encoded := buf.Bytes()
+	if len(encoded) <= AVMLHeaderSize+AVMLTrailerSize {
+		t.Fatalf("encoded block too short: %d", len(encoded))
+	}
+
+	payload := encoded[AVMLHeaderSize : len(encoded)-AVMLTrailerSize]
+	if !bytes.HasPrefix(payload, snappyStreamIdentifier) {
+		t.Fatalf("payload does not start with snappy stream identifier: % x", payload[:min(len(payload), len(snappyStreamIdentifier))])
+	}
+
+	trailer := encoded[len(encoded)-AVMLTrailerSize:]
+	gotLen := binary.LittleEndian.Uint64(trailer)
+	if gotLen != uint64(len(payload)) {
+		t.Fatalf("trailer length = %d, want compressed payload length %d", gotLen, len(payload))
 	}
 }
 
@@ -311,13 +337,10 @@ func TestAVMLDecodeTruncatedTrailer(t *testing.T) {
 
 func TestAVMLDecodeTruncatedPayload(t *testing.T) {
 	var buf bytes.Buffer
-	h := NewAVMLHeader(0x1000, 0x2000)
+	h := NewAVMLHeader(0x1000, 0x1004)
 	h.Encode(&buf)
-	// Write trailer claiming 100 bytes but only provide 10.
-	var trailer [AVMLTrailerSize]byte
-	binary.LittleEndian.PutUint64(trailer[:], 100)
-	buf.Write(trailer[:])
-	buf.Write(make([]byte, 10))
+	buf.Write(snappyStreamIdentifier)
+	buf.Write([]byte{0x00, 0x08, 0x00, 0x00}) // chunk header without payload
 
 	_, _, err := DecodeAVMLBlock(&buf)
 	if err == nil {
@@ -329,15 +352,29 @@ func TestAVMLDecodeInvalidSnappy(t *testing.T) {
 	var buf bytes.Buffer
 	h := NewAVMLHeader(0x1000, 0x2000)
 	h.Encode(&buf)
-	// Write trailer and invalid snappy data.
-	var trailer [AVMLTrailerSize]byte
-	binary.LittleEndian.PutUint64(trailer[:], 10)
-	buf.Write(trailer[:])
-	buf.Write([]byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF})
+	buf.Write([]byte{0xFF, 0xFF, 0xFF, 0xFF})
 
 	_, _, err := DecodeAVMLBlock(&buf)
 	if err == nil {
 		t.Error("expected error for invalid snappy data")
+	}
+}
+
+func TestAVMLDecodeRejectsMismatchedTrailerLength(t *testing.T) {
+	data := []byte("trailer mismatch")
+	header := NewAVMLHeader(0x1000, 0x1000+uint64(len(data)))
+
+	var buf bytes.Buffer
+	if err := EncodeAVMLBlock(&buf, header, data); err != nil {
+		t.Fatalf("EncodeAVMLBlock error: %v", err)
+	}
+
+	encoded := buf.Bytes()
+	binary.LittleEndian.PutUint64(encoded[len(encoded)-AVMLTrailerSize:], 1)
+
+	_, _, err := DecodeAVMLBlock(bytes.NewReader(encoded))
+	if err == nil {
+		t.Error("expected error for mismatched trailer length")
 	}
 }
 

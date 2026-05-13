@@ -29,7 +29,7 @@ func TestDetectFormat(t *testing.T) {
 			name: "avml",
 			data: func() []byte {
 				var buf bytes.Buffer
-				h := image.NewAVMLHeader(0x1000, 0x2000)
+				h := image.NewAVMLHeader(0x1000, 0x1003)
 				image.EncodeAVMLBlock(&buf, h, []byte{1, 2, 3})
 				return buf.Bytes()
 			}(),
@@ -68,8 +68,8 @@ func TestDetectFormat(t *testing.T) {
 
 func TestValidateFormatPair(t *testing.T) {
 	tests := []struct {
-		source Format
-		target Format
+		source  Format
+		target  Format
 		wantErr bool
 	}{
 		{FormatRaw, FormatLiME, false},
@@ -234,6 +234,81 @@ func TestConvertAVMLToRaw(t *testing.T) {
 	}
 }
 
+func TestConvertLiMEToRawZeroFillsSparseGaps(t *testing.T) {
+	var input bytes.Buffer
+	data1 := []byte{1, 2}
+	h1 := image.NewLiMEHeader(4, 6)
+	h1.Encode(&input)
+	input.Write(data1)
+
+	data2 := []byte{3, 4}
+	h2 := image.NewLiMEHeader(8, 10)
+	h2.Encode(&input)
+	input.Write(data2)
+
+	var output bytes.Buffer
+	result, err := Convert(context.Background(), &input, &output, Options{
+		SourceFormat: FormatLiME,
+		TargetFormat: FormatRaw,
+	})
+	if err != nil {
+		t.Fatalf("Convert error: %v", err)
+	}
+	if !result.Success {
+		t.Error("expected success")
+	}
+
+	want := []byte{0, 0, 0, 0, 1, 2, 0, 0, 3, 4}
+	if got := output.Bytes(); !bytes.Equal(got, want) {
+		t.Fatalf("output = %v, want %v", got, want)
+	}
+}
+
+func TestConvertAVMLToRawZeroFillsSparseGaps(t *testing.T) {
+	var input bytes.Buffer
+	h := image.NewAVMLHeader(4, 6)
+	if err := image.EncodeAVMLBlock(&input, h, []byte{1, 2}); err != nil {
+		t.Fatalf("EncodeAVMLBlock error: %v", err)
+	}
+
+	var output bytes.Buffer
+	result, err := Convert(context.Background(), &input, &output, Options{
+		SourceFormat: FormatAVML,
+		TargetFormat: FormatRaw,
+	})
+	if err != nil {
+		t.Fatalf("Convert error: %v", err)
+	}
+	if !result.Success {
+		t.Error("expected success")
+	}
+
+	want := []byte{0, 0, 0, 0, 1, 2}
+	if got := output.Bytes(); !bytes.Equal(got, want) {
+		t.Fatalf("output = %v, want %v", got, want)
+	}
+}
+
+func TestConvertEncodedToRawDoesNotInventTrailingSkippedZeroExtent(t *testing.T) {
+	var input bytes.Buffer
+	h := image.NewLiMEHeader(0, 2)
+	h.Encode(&input)
+	input.Write([]byte{1, 2})
+
+	var output bytes.Buffer
+	_, err := Convert(context.Background(), &input, &output, Options{
+		SourceFormat: FormatLiME,
+		TargetFormat: FormatRaw,
+	})
+	if err != nil {
+		t.Fatalf("Convert error: %v", err)
+	}
+
+	if got, want := output.Bytes(), []byte{1, 2}; !bytes.Equal(got, want) {
+		t.Fatalf("output = %v, want %v", got, want)
+	}
+}
+
 func TestConvertLiMEToAVML(t *testing.T) {
 	// Create LiME input.
 	var input bytes.Buffer
@@ -267,6 +342,62 @@ func TestConvertLiMEToAVML(t *testing.T) {
 	}
 	if !bytes.Equal(payload, data) {
 		t.Errorf("payload = %v, want %v", payload, data)
+	}
+}
+
+func TestConvertRawToAVMLSplitsLargeChunks(t *testing.T) {
+	data := bytes.Repeat([]byte{0x5a}, image.AVMLBlockSize+3)
+	var output bytes.Buffer
+
+	result, err := Convert(context.Background(), bytes.NewReader(data), &output, Options{
+		SourceFormat: FormatRaw,
+		TargetFormat: FormatAVML,
+		ChunkSize:    int64(len(data)),
+	})
+	if err != nil {
+		t.Fatalf("Convert error: %v", err)
+	}
+	if !result.Success {
+		t.Error("expected success")
+	}
+
+	blocks := decodeAVMLBlocks(t, output.Bytes())
+	if len(blocks) != 2 {
+		t.Fatalf("block count = %d, want 2", len(blocks))
+	}
+	if blocks[0].header.Start != 0 || blocks[0].header.RangeLen() != image.AVMLBlockSize {
+		t.Fatalf("first block range = 0x%x len %d, want start 0 len %d", blocks[0].header.Start, blocks[0].header.RangeLen(), image.AVMLBlockSize)
+	}
+	if blocks[1].header.Start != image.AVMLBlockSize || blocks[1].header.RangeLen() != 3 {
+		t.Fatalf("second block range = 0x%x len %d, want start %d len 3", blocks[1].header.Start, blocks[1].header.RangeLen(), image.AVMLBlockSize)
+	}
+}
+
+func TestConvertLiMEToAVMLSplitsLargeBlocks(t *testing.T) {
+	data := bytes.Repeat([]byte{0xa5}, image.AVMLBlockSize+1)
+	var input bytes.Buffer
+	h := image.NewLiMEHeader(0x1000, 0x1000+uint64(len(data)))
+	h.Encode(&input)
+	input.Write(data)
+
+	var output bytes.Buffer
+	_, err := Convert(context.Background(), &input, &output, Options{
+		SourceFormat: FormatLiME,
+		TargetFormat: FormatAVML,
+	})
+	if err != nil {
+		t.Fatalf("Convert error: %v", err)
+	}
+
+	blocks := decodeAVMLBlocks(t, output.Bytes())
+	if len(blocks) != 2 {
+		t.Fatalf("block count = %d, want 2", len(blocks))
+	}
+	if blocks[0].header.RangeLen() != image.AVMLBlockSize {
+		t.Fatalf("first block length = %d, want %d", blocks[0].header.RangeLen(), image.AVMLBlockSize)
+	}
+	if blocks[1].header.Start != 0x1000+image.AVMLBlockSize || blocks[1].header.RangeLen() != 1 {
+		t.Fatalf("second block range = 0x%x len %d", blocks[1].header.Start, blocks[1].header.RangeLen())
 	}
 }
 
@@ -394,4 +525,23 @@ func TestConvertAutoDetect(t *testing.T) {
 	if result.SourceFormat != FormatLiME {
 		t.Errorf("SourceFormat = %v, want LiME", result.SourceFormat)
 	}
+}
+
+type avmlTestBlock struct {
+	header *image.AVMLHeader
+	data   []byte
+}
+
+func decodeAVMLBlocks(t *testing.T, data []byte) []avmlTestBlock {
+	t.Helper()
+	r := bytes.NewReader(data)
+	var blocks []avmlTestBlock
+	for r.Len() > 0 {
+		header, payload, err := image.DecodeAVMLBlock(r)
+		if err != nil {
+			t.Fatalf("DecodeAVMLBlock error: %v", err)
+		}
+		blocks = append(blocks, avmlTestBlock{header: header, data: payload})
+	}
+	return blocks
 }

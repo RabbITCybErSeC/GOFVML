@@ -2,6 +2,7 @@ package testhelpers
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -45,13 +46,13 @@ func TestRunWithCancel(t *testing.T) {
 
 func TestWaitForCondition(t *testing.T) {
 	// Condition that becomes true after a short delay.
-	ready := false
+	var ready atomic.Bool
 	go func() {
 		time.Sleep(50 * time.Millisecond)
-		ready = true
+		ready.Store(true)
 	}()
 
-	if !WaitForCondition(200*time.Millisecond, func() bool { return ready }) {
+	if !WaitForCondition(200*time.Millisecond, ready.Load) {
 		t.Error("expected condition to become true")
 	}
 

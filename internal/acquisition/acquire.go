@@ -30,6 +30,12 @@ type Options struct {
 	Progress progress.Callback
 	// SkipZeroBlocks omits all-zero blocks from output when true.
 	SkipZeroBlocks bool
+	// Sources overrides the default physical source list. It is primarily used
+	// by tests and internal callers that already selected a source.
+	Sources []source.Source
+	// Output overrides safe file creation. Callers that set Output are
+	// responsible for opening it safely.
+	Output io.WriteCloser
 }
 
 // Result holds the outcome of a physical acquisition.
@@ -81,7 +87,10 @@ func Acquire(ctx context.Context, opts Options) (*Result, error) {
 	var reader source.Reader
 	var diag *diagnostic.Diagnostic
 
-	sources := source.DefaultSources()
+	sources := opts.Sources
+	if sources == nil {
+		sources = source.DefaultSources()
+	}
 	if opts.SourceName != "" {
 		// Explicit source mode.
 		reader, diag = source.OpenExplicit(ctx, sources, opts.SourceName)
@@ -108,12 +117,16 @@ func Acquire(ctx context.Context, opts Options) (*Result, error) {
 	defer reader.Close()
 
 	// Create output file safely.
-	output, err := createSafeOutput(opts.OutputPath)
-	if err != nil {
-		return nil, diagnostic.SourceError("failed to create output file").
-			WithOperation("physical acquisition").
-			WithTarget(opts.OutputPath).
-			WithCause(err)
+	output := opts.Output
+	if output == nil {
+		var err error
+		output, err = createSafeOutput(opts.OutputPath)
+		if err != nil {
+			return nil, diagnostic.SourceError("failed to create output file").
+				WithOperation("physical acquisition").
+				WithTarget(opts.OutputPath).
+				WithCause(err)
+		}
 	}
 	defer output.Close()
 
@@ -131,6 +144,7 @@ func Acquire(ctx context.Context, opts Options) (*Result, error) {
 	var bytesWritten uint64
 	var blocksWritten uint64
 	var blocksSkipped uint64
+	var failures uint64
 	var currentBytes uint64
 
 	for _, rng := range opts.Ranges {
@@ -152,6 +166,7 @@ func Acquire(ctx context.Context, opts Options) (*Result, error) {
 				WithOperation("physical acquisition").
 				WithTarget(fmt.Sprintf("0x%x-0x%x", rng.Start, rng.End)).
 				WithCause(err))
+			failures++
 			continue
 		}
 
@@ -184,6 +199,7 @@ func Acquire(ctx context.Context, opts Options) (*Result, error) {
 				WithOperation("physical acquisition").
 				WithTarget(fmt.Sprintf("0x%x-0x%x", rng.Start, rng.End)).
 				WithCause(writeErr))
+			failures++
 			continue
 		}
 
@@ -200,11 +216,24 @@ func Acquire(ctx context.Context, opts Options) (*Result, error) {
 		})
 	}
 
-	result.Success = true
 	result.BytesWritten = bytesWritten
 	result.BlocksWritten = blocksWritten
 	result.BlocksSkipped = blocksSkipped
+	if failures > 0 {
+		result.Success = false
+		return result, diagnostic.SourceError("physical acquisition incomplete").
+			WithOperation("physical acquisition").
+			WithTarget(opts.OutputPath).
+			WithCause(fmt.Errorf("%d block(s) failed", failures))
+	}
+	if blocksWritten+blocksSkipped == 0 {
+		result.Success = false
+		return result, diagnostic.SourceError("physical acquisition wrote no blocks").
+			WithOperation("physical acquisition").
+			WithTarget(opts.OutputPath)
+	}
 
+	result.Success = true
 	return result, nil
 }
 
@@ -244,12 +273,28 @@ func writeLiMEBlock(w io.Writer, block phys.Block) (uint64, error) {
 
 // writeAVMLBlock writes a physical block as an AVML-compressed block.
 func writeAVMLBlock(w io.Writer, block phys.Block) (uint64, error) {
-	header := image.NewAVMLHeader(block.Range.Start, block.Range.End)
-	if err := image.EncodeAVMLBlock(w, header, block.Data); err != nil {
-		return 0, fmt.Errorf("encode AVML block: %w", err)
+	var total uint64
+	for _, rng := range image.SplitRange(block.Range.Start, block.Range.Start+uint64(len(block.Data))) {
+		start := rng.Start - block.Range.Start
+		end := rng.End - block.Range.Start
+		header := image.NewAVMLHeader(rng.Start, rng.End)
+		cw := &countingWriter{w: w}
+		if err := image.EncodeAVMLBlock(cw, header, block.Data[start:end]); err != nil {
+			return total, fmt.Errorf("encode AVML block: %w", err)
+		}
+		total += uint64(cw.n)
 	}
 
-	// We can't easily know the exact bytes written without buffering.
-	// Return an estimate for progress tracking.
-	return uint64(image.AVMLHeaderSize + len(block.Data) + image.AVMLTrailerSize), nil
+	return total, nil
+}
+
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
 }

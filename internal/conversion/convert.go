@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/RabbITCybErSeC/gofvml/internal/diagnostic"
@@ -194,6 +195,7 @@ func convertRaw(ctx context.Context, input io.Reader, output io.Writer, opts Opt
 
 func convertLiME(ctx context.Context, input io.Reader, output io.Writer, opts Options, result *Result, reporter *progress.Reporter) error {
 	// LiME to raw or AVML: read LiME blocks, decode, write in target format.
+	var rawOffset uint64
 	for {
 		select {
 		case <-ctx.Done():
@@ -229,9 +231,7 @@ func convertLiME(ctx context.Context, input io.Reader, output io.Writer, opts Op
 		var writeErr error
 		switch opts.TargetFormat {
 		case FormatRaw:
-			// For raw output, we need to handle gaps (sparse file behavior).
-			// Write zeros from current position to block start, then payload.
-			written, writeErr = writeLiMEBlockAsRaw(output, header.Start, payload)
+			written, rawOffset, writeErr = writeEncodedBlockAsRaw(output, rawOffset, header.Start, payload)
 		case FormatAVML:
 			written, writeErr = writeLiMEBlockAsAVML(output, header, payload)
 		}
@@ -256,6 +256,7 @@ func convertLiME(ctx context.Context, input io.Reader, output io.Writer, opts Op
 
 func convertAVML(ctx context.Context, input io.Reader, output io.Writer, opts Options, result *Result, reporter *progress.Reporter) error {
 	// AVML to raw or LiME: read AVML blocks, decompress, write in target format.
+	var rawOffset uint64
 	for {
 		select {
 		case <-ctx.Done():
@@ -282,7 +283,7 @@ func convertAVML(ctx context.Context, input io.Reader, output io.Writer, opts Op
 		var writeErr error
 		switch opts.TargetFormat {
 		case FormatRaw:
-			written, writeErr = writeAVMLBlockAsRaw(output, header.Start, payload)
+			written, rawOffset, writeErr = writeEncodedBlockAsRaw(output, rawOffset, header.Start, payload)
 		case FormatLiME:
 			written, writeErr = writeAVMLBlockAsLiME(output, header, payload)
 		}
@@ -319,33 +320,46 @@ func writeRawChunkAsLiME(w io.Writer, offset uint64, data []byte) (int64, error)
 }
 
 func writeRawChunkAsAVML(w io.Writer, offset uint64, data []byte) (int64, error) {
-	header := image.NewAVMLHeader(offset, offset+uint64(len(data)))
-	if err := image.EncodeAVMLBlock(w, header, data); err != nil {
-		return 0, err
-	}
-	return int64(image.AVMLHeaderSize + len(data) + image.AVMLTrailerSize), nil
+	return writeAVMLBlocks(w, offset, data)
 }
 
-func writeLiMEBlockAsRaw(w io.Writer, start uint64, payload []byte) (int64, error) {
-	if _, err := w.Write(payload); err != nil {
-		return 0, err
+func writeAVMLBlocks(w io.Writer, offset uint64, data []byte) (int64, error) {
+	var total int64
+	for _, block := range image.SplitRange(offset, offset+uint64(len(data))) {
+		start := block.Start - offset
+		end := block.End - offset
+		header := image.NewAVMLHeader(block.Start, block.End)
+		cw := &countingWriter{w: w}
+		if err := image.EncodeAVMLBlock(cw, header, data[start:end]); err != nil {
+			return total, err
+		}
+		total += cw.n
 	}
-	return int64(len(payload)), nil
+	return total, nil
+}
+
+func writeEncodedBlockAsRaw(w io.Writer, currentOffset, start uint64, payload []byte) (int64, uint64, error) {
+	if start < currentOffset {
+		return 0, currentOffset, fmt.Errorf("encoded block start 0x%x overlaps current raw offset 0x%x", start, currentOffset)
+	}
+
+	var written int64
+	if gap := start - currentOffset; gap > 0 {
+		n, err := io.CopyN(w, zeroReader{}, int64(gap))
+		written += n
+		if err != nil {
+			return written, currentOffset + uint64(written), err
+		}
+	}
+	if _, err := w.Write(payload); err != nil {
+		return written, currentOffset + uint64(written), err
+	}
+	written += int64(len(payload))
+	return written, start + uint64(len(payload)), nil
 }
 
 func writeLiMEBlockAsAVML(w io.Writer, header *image.LiMEHeader, payload []byte) (int64, error) {
-	avmlHeader := image.NewAVMLHeader(header.Start, header.ExclusiveEnd())
-	if err := image.EncodeAVMLBlock(w, avmlHeader, payload); err != nil {
-		return 0, err
-	}
-	return int64(image.AVMLHeaderSize + len(payload) + image.AVMLTrailerSize), nil
-}
-
-func writeAVMLBlockAsRaw(w io.Writer, start uint64, payload []byte) (int64, error) {
-	if _, err := w.Write(payload); err != nil {
-		return 0, err
-	}
-	return int64(len(payload)), nil
+	return writeAVMLBlocks(w, header.Start, payload)
 }
 
 func writeAVMLBlockAsLiME(w io.Writer, header *image.AVMLHeader, payload []byte) (int64, error) {
@@ -366,4 +380,24 @@ func isAllZeros(data []byte) bool {
 		}
 	}
 	return true
+}
+
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
 }
