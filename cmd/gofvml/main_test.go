@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -45,21 +48,24 @@ func TestCLI_Help(t *testing.T) {
 }
 
 func TestCLI_Physical_MissingOutput(t *testing.T) {
-	oldArgs := os.Args
-	defer func() { os.Args = oldArgs }()
-
-	os.Args = []string{"gofvml", "physical"}
-
-	// Should exit with error; we can't capture os.Exit easily in tests.
-	// Just verify the flag set is configured correctly by parsing manually.
+	code := runPhysical(nil)
+	if code == 0 {
+		t.Fatal("expected physical command to fail without -output")
+	}
 }
 
 func TestCLI_Process_MissingPID(t *testing.T) {
-	oldArgs := os.Args
-	defer func() { os.Args = oldArgs }()
+	code := runProcess([]string{"-output", "/tmp/test.art"})
+	if code == 0 {
+		t.Fatal("expected process command to fail without -pid")
+	}
+}
 
-	os.Args = []string{"gofvml", "process", "-output", "/tmp/test.art"}
-	// Should require PID.
+func TestCLI_Process_MissingOutput(t *testing.T) {
+	code := runProcess([]string{"-pid", "123"})
+	if code == 0 {
+		t.Fatal("expected process command to fail without -output")
+	}
 }
 
 func TestBuildProcessArtifactUsesAcquiredPayloadBlocks(t *testing.T) {
@@ -119,6 +125,115 @@ func TestRunUploadRejectsMissingRequiredFlags(t *testing.T) {
 	code := runUpload(nil)
 	if code == 0 {
 		t.Fatal("expected upload command to fail without required flags")
+	}
+}
+
+func TestRunConvertPerformsRawToLiMEConversion(t *testing.T) {
+	tmp := t.TempDir()
+	input := filepath.Join(tmp, "memory.raw")
+	output := filepath.Join(tmp, "memory.lime")
+	if err := os.WriteFile(input, []byte("primary gofvml convert"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	code := runConvert([]string{
+		"-input", input,
+		"-output", output,
+		"-from", "raw",
+		"-to", "lime",
+		"-skip-zero=false",
+	})
+	if code != 0 {
+		t.Fatalf("runConvert exit code = %d", code)
+	}
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(data, []byte("primary gofvml convert")) {
+		t.Fatalf("converted output does not contain source payload: %x", data)
+	}
+}
+
+func TestRunConvertDoesNotOverwriteExistingOutput(t *testing.T) {
+	tmp := t.TempDir()
+	input := filepath.Join(tmp, "memory.raw")
+	output := filepath.Join(tmp, "memory.lime")
+	if err := os.WriteFile(input, []byte("source"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(output, []byte("existing"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	code := runConvert([]string{"-input", input, "-output", output, "-from", "raw", "-to", "lime"})
+	if code == 0 {
+		t.Fatal("expected runConvert to reject existing output")
+	}
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "existing" {
+		t.Fatalf("existing output was overwritten: %q", data)
+	}
+}
+
+func TestRunCompressWritesAVMLOutputByDefault(t *testing.T) {
+	tmp := t.TempDir()
+	input := filepath.Join(tmp, "memory.raw")
+	output := filepath.Join(tmp, "memory.avml")
+	if err := os.WriteFile(input, []byte("primary gofvml compress"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	code := runCompress([]string{
+		"-input", input,
+		"-output", output,
+		"-from", "raw",
+		"-skip-zero=false",
+	})
+	if code != 0 {
+		t.Fatalf("runCompress exit code = %d", code)
+	}
+	f, err := os.Open(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if got, err := conversion.DetectFormat(f); err != nil || got != conversion.FormatAVML {
+		t.Fatalf("DetectFormat = %s, %v; want avml", got, err)
+	}
+}
+
+func TestRunUploadSendsFileToHTTPServer(t *testing.T) {
+	payload := []byte("primary gofvml upload")
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", r.Method)
+		}
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	tmp := t.TempDir()
+	file := filepath.Join(tmp, "memory.lime")
+	if err := os.WriteFile(file, payload, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	code := runUpload([]string{"-file", file, "-url", server.URL + "/upload", "-retries", "0"})
+	if code != 0 {
+		t.Fatalf("runUpload exit code = %d", code)
+	}
+	if !bytes.Equal(gotBody, payload) {
+		t.Fatalf("uploaded body = %q, want payload", gotBody)
 	}
 }
 
