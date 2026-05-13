@@ -4,16 +4,19 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/RabbITCybErSeC/gofvml/internal/acquisition"
 	"github.com/RabbITCybErSeC/gofvml/internal/cli"
+	"github.com/RabbITCybErSeC/gofvml/internal/conversion"
 	"github.com/RabbITCybErSeC/gofvml/internal/iomem"
 	"github.com/RabbITCybErSeC/gofvml/internal/process"
 	"github.com/RabbITCybErSeC/gofvml/internal/procfs"
 	"github.com/RabbITCybErSeC/gofvml/internal/progress"
+	"github.com/RabbITCybErSeC/gofvml/internal/upload"
 )
 
 func main() {
@@ -27,6 +30,12 @@ func main() {
 		os.Exit(runPhysical(os.Args[2:]))
 	case "process":
 		os.Exit(runProcess(os.Args[2:]))
+	case "convert":
+		os.Exit(runConvert(os.Args[2:]))
+	case "compress":
+		os.Exit(runCompress(os.Args[2:]))
+	case "upload":
+		os.Exit(runUpload(os.Args[2:]))
 	case "version":
 		fmt.Println("gofvml v0.1.0")
 		os.Exit(0)
@@ -48,6 +57,9 @@ func printUsage() {
 	fmt.Println("Commands:")
 	fmt.Println("  physical   Acquire physical memory")
 	fmt.Println("  process    Acquire process memory")
+	fmt.Println("  convert    Convert memory image formats")
+	fmt.Println("  compress   Compress memory images to AVML-compatible format")
+	fmt.Println("  upload     Upload memory images via HTTP PUT")
 	fmt.Println("  version    Print version")
 	fmt.Println("  help       Show this help message")
 	fmt.Println()
@@ -248,4 +260,262 @@ func buildProcessArtifact(result *process.Result, strict bool, timestamp time.Ti
 	}
 
 	return meta, blocks
+}
+
+type convertConfig struct {
+	input        string
+	output       string
+	fromFormat   string
+	toFormat     string
+	skipZero     bool
+	progressFlag bool
+}
+
+type compressConfig struct {
+	input        string
+	output       string
+	fromFormat   string
+	format       string
+	skipZero     bool
+	progressFlag bool
+}
+
+type convertRunner interface {
+	Run(context.Context, io.Reader, io.Writer, conversion.Options) (*conversion.Result, error)
+}
+
+type convertRunnerFunc func(context.Context, io.Reader, io.Writer, conversion.Options) (*conversion.Result, error)
+
+func (f convertRunnerFunc) Run(ctx context.Context, input io.Reader, output io.Writer, opts conversion.Options) (*conversion.Result, error) {
+	return f(ctx, input, output, opts)
+}
+
+var defaultConvertRunner convertRunner = convertRunnerFunc(conversion.Convert)
+
+func runConvert(args []string) int {
+	fs := flag.NewFlagSet("convert", flag.ContinueOnError)
+	cfg := convertConfig{skipZero: true}
+	fs.StringVar(&cfg.input, "input", "", "Input file path (required)")
+	fs.StringVar(&cfg.output, "output", "", "Output file path (required)")
+	fs.StringVar(&cfg.fromFormat, "from", "", "Source format: raw, lime, or avml (auto-detect if empty)")
+	fs.StringVar(&cfg.toFormat, "to", "", "Target format: raw, lime, or avml (required)")
+	fs.BoolVar(&cfg.skipZero, "skip-zero", true, "Skip all-zero chunks")
+	fs.BoolVar(&cfg.progressFlag, "progress", false, "Show progress on stderr")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: gofvml convert [options]\n\n")
+		fmt.Fprintf(os.Stderr, "Convert between memory image formats.\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	return runConvertConfig(context.Background(), cfg, defaultConvertRunner)
+}
+
+func runCompress(args []string) int {
+	fs := flag.NewFlagSet("compress", flag.ContinueOnError)
+	cfg := compressConfig{format: "avml", skipZero: true}
+	fs.StringVar(&cfg.input, "input", "", "Input file path (required)")
+	fs.StringVar(&cfg.output, "output", "", "Output file path (required)")
+	fs.StringVar(&cfg.fromFormat, "from", "", "Source format: raw, lime, or avml (auto-detect if empty)")
+	fs.StringVar(&cfg.format, "format", "avml", "Compressed target format: avml")
+	fs.BoolVar(&cfg.skipZero, "skip-zero", true, "Skip all-zero chunks")
+	fs.BoolVar(&cfg.progressFlag, "progress", false, "Show progress on stderr")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: gofvml compress [options]\n\n")
+		fmt.Fprintf(os.Stderr, "Compress memory images to AVML-compatible format.\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	if cfg.input == "" || cfg.output == "" {
+		fmt.Fprintln(os.Stderr, "Error: -input and -output are required")
+		fs.Usage()
+		return 1
+	}
+	opts, err := buildCompressOptions(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	return runConvertFiles(context.Background(), cfg.input, cfg.output, opts, defaultConvertRunner)
+}
+
+func runConvertConfig(ctx context.Context, cfg convertConfig, runner convertRunner) int {
+	if cfg.input == "" || cfg.output == "" || cfg.toFormat == "" {
+		fmt.Fprintln(os.Stderr, "Error: -input, -output, and -to are required")
+		return 1
+	}
+	sourceFormat, err := parseFormat(cfg.fromFormat, true)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	targetFormat, err := parseFormat(cfg.toFormat, false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	opts := conversion.Options{
+		SourceFormat:   sourceFormat,
+		TargetFormat:   targetFormat,
+		SkipZeroChunks: cfg.skipZero,
+		Progress:       progressCallback(cfg.progressFlag),
+	}
+	return runConvertFiles(ctx, cfg.input, cfg.output, opts, runner)
+}
+
+func buildCompressOptions(cfg compressConfig) (conversion.Options, error) {
+	targetFormat, err := parseFormat(defaultString(cfg.format, "avml"), false)
+	if err != nil {
+		return conversion.Options{}, err
+	}
+	if targetFormat != conversion.FormatAVML {
+		return conversion.Options{}, fmt.Errorf("compress format must be avml")
+	}
+	sourceFormat, err := parseFormat(cfg.fromFormat, true)
+	if err != nil {
+		return conversion.Options{}, err
+	}
+	return conversion.Options{
+		SourceFormat:   sourceFormat,
+		TargetFormat:   targetFormat,
+		SkipZeroChunks: cfg.skipZero,
+		Progress:       progressCallback(cfg.progressFlag),
+	}, nil
+}
+
+func runConvertFiles(ctx context.Context, inputPath, outputPath string, opts conversion.Options, runner convertRunner) int {
+	input, err := os.Open(inputPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot open input: %v\n", err)
+		return 1
+	}
+	defer input.Close()
+
+	output, err := os.OpenFile(outputPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL|os.O_TRUNC, 0600)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot create output: %v\n", err)
+		return 1
+	}
+	defer output.Close()
+
+	if err := runConversion(ctx, input, output, opts, runner); err != nil {
+		fmt.Fprintf(os.Stderr, "\nError: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func runConversion(ctx context.Context, input io.Reader, output io.Writer, opts conversion.Options, runner convertRunner) error {
+	result, err := runner.Run(ctx, input, output, opts)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Conversion complete\n")
+	fmt.Printf("  Source format: %s\n", result.SourceFormat)
+	fmt.Printf("  Target format: %s\n", result.TargetFormat)
+	fmt.Printf("  Bytes read: %d\n", result.BytesRead)
+	fmt.Printf("  Bytes written: %d\n", result.BytesWritten)
+	fmt.Printf("  Chunks processed: %d\n", result.ChunksRead)
+	if result.ChunksSkipped > 0 {
+		fmt.Printf("  Chunks skipped: %d\n", result.ChunksSkipped)
+	}
+	cli.RenderDiagnostics(os.Stdout, result.Warnings)
+	return nil
+}
+
+type uploadRunner interface {
+	Run(context.Context, upload.Options) (*upload.Result, error)
+}
+
+type uploadRunnerFunc func(context.Context, upload.Options) (*upload.Result, error)
+
+func (f uploadRunnerFunc) Run(ctx context.Context, opts upload.Options) (*upload.Result, error) {
+	return f(ctx, opts)
+}
+
+var defaultUploadRunner uploadRunner = uploadRunnerFunc(upload.Upload)
+
+func runUpload(args []string) int {
+	fs := flag.NewFlagSet("upload", flag.ContinueOnError)
+	var opts upload.Options
+	fs.StringVar(&opts.FilePath, "file", "", "Local file path to upload (required)")
+	fs.StringVar(&opts.URL, "url", "", "Destination URL for HTTP PUT (required)")
+	fs.BoolVar(&opts.DeleteAfter, "delete-after", false, "Delete local file after successful upload")
+	progressFlag := fs.Bool("progress", false, "Show progress on stderr")
+	fs.IntVar(&opts.Retries, "retries", 3, "Number of retry attempts")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: gofvml upload [options]\n\n")
+		fmt.Fprintf(os.Stderr, "Upload memory images via HTTP PUT.\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	if opts.FilePath == "" || opts.URL == "" {
+		fmt.Fprintln(os.Stderr, "Error: -file and -url are required")
+		fs.Usage()
+		return 1
+	}
+	opts.Progress = progressCallback(*progressFlag)
+	if err := runUploadWorkflow(context.Background(), opts, defaultUploadRunner); err != nil {
+		fmt.Fprintf(os.Stderr, "\nError: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func runUploadWorkflow(ctx context.Context, opts upload.Options, runner uploadRunner) error {
+	result, err := runner.Run(ctx, opts)
+	if err != nil {
+		if result != nil {
+			cli.RenderDiagnostics(os.Stderr, result.Warnings)
+		}
+		return err
+	}
+	fmt.Printf("Upload complete: %s\n", opts.FilePath)
+	fmt.Printf("  Destination: %s\n", result.URL)
+	fmt.Printf("  Bytes uploaded: %d\n", result.BytesUploaded)
+	cli.RenderDiagnostics(os.Stdout, result.Warnings)
+	return nil
+}
+
+func parseFormat(value string, allowUnknown bool) (conversion.Format, error) {
+	switch strings.ToLower(value) {
+	case "":
+		if allowUnknown {
+			return conversion.FormatUnknown, nil
+		}
+	case "raw":
+		return conversion.FormatRaw, nil
+	case "lime":
+		return conversion.FormatLiME, nil
+	case "avml":
+		return conversion.FormatAVML, nil
+	}
+	return conversion.FormatUnknown, fmt.Errorf("unknown format %q", value)
+}
+
+func progressCallback(enabled bool) progress.Callback {
+	if !enabled {
+		return nil
+	}
+	return func(e progress.Event) {
+		fmt.Fprintf(os.Stderr, "\r%s", e.String())
+	}
+}
+
+func defaultString(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
 }

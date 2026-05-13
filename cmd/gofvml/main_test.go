@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"io"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/RabbITCybErSeC/gofvml/internal/conversion"
 	"github.com/RabbITCybErSeC/gofvml/internal/process"
 	"github.com/RabbITCybErSeC/gofvml/internal/procfs"
+	"github.com/RabbITCybErSeC/gofvml/internal/upload"
 )
 
 func TestCLI_Help(t *testing.T) {
@@ -31,6 +36,11 @@ func TestCLI_Help(t *testing.T) {
 	}
 	if !strings.Contains(output, "process") {
 		t.Error("expected help text to mention process command")
+	}
+	for _, command := range []string{"convert", "compress", "upload"} {
+		if !strings.Contains(output, command) {
+			t.Errorf("expected help text to mention %s command", command)
+		}
 	}
 }
 
@@ -85,6 +95,68 @@ func TestBuildProcessArtifactUsesAcquiredPayloadBlocks(t *testing.T) {
 	}
 }
 
+func TestRunConvertRejectsMissingRequiredFlags(t *testing.T) {
+	code := runConvert(nil)
+	if code == 0 {
+		t.Fatal("expected convert command to fail without required flags")
+	}
+}
+
+func TestBuildCompressOptionsDefaultsToAVML(t *testing.T) {
+	opts, err := buildCompressOptions(compressConfig{fromFormat: "lime"})
+	if err != nil {
+		t.Fatalf("buildCompressOptions error: %v", err)
+	}
+	if opts.SourceFormat != conversion.FormatLiME {
+		t.Fatalf("SourceFormat = %s, want lime", opts.SourceFormat)
+	}
+	if opts.TargetFormat != conversion.FormatAVML {
+		t.Fatalf("TargetFormat = %s, want avml", opts.TargetFormat)
+	}
+}
+
+func TestRunUploadRejectsMissingRequiredFlags(t *testing.T) {
+	code := runUpload(nil)
+	if code == 0 {
+		t.Fatal("expected upload command to fail without required flags")
+	}
+}
+
+func TestConvertRunnerUsesConversionWorkflow(t *testing.T) {
+	var called bool
+	var output bytes.Buffer
+	runner := convertRunnerFunc(func(ctx context.Context, input io.Reader, out io.Writer, opts conversion.Options) (*conversion.Result, error) {
+		called = true
+		if opts.TargetFormat != conversion.FormatAVML {
+			t.Fatalf("TargetFormat = %s, want avml", opts.TargetFormat)
+		}
+		return &conversion.Result{Success: true, TargetFormat: opts.TargetFormat}, nil
+	})
+	if err := runConversion(context.Background(), nil, &output, conversion.Options{TargetFormat: conversion.FormatAVML}, runner); err != nil {
+		t.Fatalf("runConversion error: %v", err)
+	}
+	if !called {
+		t.Fatal("expected conversion runner to be called")
+	}
+}
+
+func TestUploadRunnerUsesUploadWorkflow(t *testing.T) {
+	var called bool
+	runner := uploadRunnerFunc(func(ctx context.Context, opts upload.Options) (*upload.Result, error) {
+		called = true
+		if opts.Retries != 2 {
+			t.Fatalf("Retries = %d, want 2", opts.Retries)
+		}
+		return &upload.Result{Success: true, URL: opts.URL}, nil
+	})
+	if err := runUploadWorkflow(context.Background(), upload.Options{URL: "http://example.test", Retries: 2}, runner); err != nil {
+		t.Fatalf("runUploadWorkflow error: %v", err)
+	}
+	if !called {
+		t.Fatal("expected upload runner to be called")
+	}
+}
+
 func printUsageTo(w *strings.Builder) {
 	w.WriteString("gofvml - Linux volatile memory acquisition tool\n")
 	w.WriteString("\n")
@@ -93,6 +165,9 @@ func printUsageTo(w *strings.Builder) {
 	w.WriteString("Commands:\n")
 	w.WriteString("  physical   Acquire physical memory\n")
 	w.WriteString("  process    Acquire process memory\n")
+	w.WriteString("  convert    Convert memory image formats\n")
+	w.WriteString("  compress   Compress memory images\n")
+	w.WriteString("  upload     Upload memory images\n")
 	w.WriteString("  version    Print version\n")
 	w.WriteString("  help       Show this help message\n")
 	w.WriteString("\n")
