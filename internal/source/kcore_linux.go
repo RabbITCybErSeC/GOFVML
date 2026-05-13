@@ -183,7 +183,7 @@ func (k *kcoreReader) ReadAt(p []byte, off uint64) (int, error) {
 	}
 
 	if mappingIdx < 0 {
-		return 0, fmt.Errorf("physical address 0x%x not mapped in /proc/kcore", off)
+		return 0, NewNotMappedError(off, PathProcKcore)
 	}
 
 	mapping := k.mappings[mappingIdx]

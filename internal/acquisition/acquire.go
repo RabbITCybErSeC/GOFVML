@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/RabbITCybErSeC/gofvml/internal/diagnostic"
 	"github.com/RabbITCybErSeC/gofvml/internal/image"
@@ -83,42 +84,20 @@ func Acquire(ctx context.Context, opts Options) (*Result, error) {
 			WithSuggestion("use 'lime' or 'avml'")
 	}
 
-	// Open memory source.
-	var reader source.Reader
-	var diag *diagnostic.Diagnostic
-
 	sources := opts.Sources
 	if sources == nil {
 		sources = source.DefaultSources()
 	}
-	if opts.SourceName != "" {
-		// Explicit source mode.
-		reader, diag = source.OpenExplicit(ctx, sources, opts.SourceName)
-		if diag != nil {
-			return nil, diag
-		}
-		result.SourceName = opts.SourceName
-	} else {
-		// Auto fallback mode.
-		var src source.Source
-		var avail source.Availability
-		src, avail = source.FindAvailableSource(ctx, sources)
-		if src == nil {
-			return nil, diagnostic.SourceError("no available memory sources").
-				WithOperation("physical acquisition").
-				WithCause(fmt.Errorf("%s", avail.Reason))
-		}
-		result.SourceName = src.Info().Name
-		reader, diag = src.Open(ctx)
-		if diag != nil {
-			return nil, diag
-		}
-	}
-	defer reader.Close()
 
-	// Create output file safely.
-	output := opts.Output
-	if output == nil {
+	var output io.WriteCloser
+	ensureOutput := func() (io.WriteCloser, error) {
+		if output != nil {
+			return output, nil
+		}
+		if opts.Output != nil {
+			output = opts.Output
+			return output, nil
+		}
 		var err error
 		output, err = createSafeOutput(opts.OutputPath)
 		if err != nil {
@@ -127,13 +106,76 @@ func Acquire(ctx context.Context, opts Options) (*Result, error) {
 				WithTarget(opts.OutputPath).
 				WithCause(err)
 		}
+		return output, nil
 	}
-	defer output.Close()
+	defer func() {
+		if output != nil {
+			output.Close()
+		}
+	}()
 
 	// Set up progress reporter.
 	reporter := progress.NewReporter(opts.Progress)
 	defer reporter.Close()
 
+	if opts.SourceName != "" {
+		// Explicit source mode.
+		reader, diag := source.OpenExplicit(ctx, sources, opts.SourceName)
+		if diag != nil {
+			return nil, diag
+		}
+		defer reader.Close()
+		output, err := ensureOutput()
+		if err != nil {
+			return nil, err
+		}
+		result.SourceName = opts.SourceName
+		return acquireWithReader(ctx, opts, result, reader, output, reporter)
+	}
+
+	var unavailable []string
+	for _, src := range sources {
+		avail := src.Check(ctx)
+		if !avail.Available {
+			unavailable = append(unavailable, fmt.Sprintf("%s: %s", src.Info().Name, avail.Reason))
+			continue
+		}
+
+		reader, diag := src.Open(ctx)
+		if diag != nil {
+			return nil, diag
+		}
+
+		output, err := ensureOutput()
+		if err != nil {
+			reader.Close()
+			return nil, err
+		}
+		attempt := &Result{
+			OutputPath: opts.OutputPath,
+			SourceName: src.Info().Name,
+		}
+		attempt, err = acquireWithReader(ctx, opts, attempt, reader, output, reporter)
+		reader.Close()
+		if err == nil {
+			return attempt, nil
+		}
+		if canRetryWithNextSource(attempt) {
+			continue
+		}
+		return attempt, err
+	}
+
+	cause := "no available memory sources found"
+	if len(unavailable) > 0 {
+		cause = strings.Join(unavailable, "; ")
+	}
+	return nil, diagnostic.SourceError("no available memory sources").
+		WithOperation("physical acquisition").
+		WithCause(fmt.Errorf("%s", cause))
+}
+
+func acquireWithReader(ctx context.Context, opts Options, result *Result, reader source.Reader, output io.Writer, reporter *progress.Reporter) (*Result, error) {
 	// Calculate total bytes for progress.
 	var totalBytes uint64
 	for _, r := range opts.Ranges {
@@ -145,6 +187,7 @@ func Acquire(ctx context.Context, opts Options) (*Result, error) {
 	var blocksWritten uint64
 	var blocksSkipped uint64
 	var failures uint64
+	var unmappedFailures uint64
 	var currentBytes uint64
 
 	for _, rng := range opts.Ranges {
@@ -167,6 +210,9 @@ func Acquire(ctx context.Context, opts Options) (*Result, error) {
 				WithTarget(fmt.Sprintf("0x%x-0x%x", rng.Start, rng.End)).
 				WithCause(err))
 			failures++
+			if source.IsNotMapped(err) {
+				unmappedFailures++
+			}
 			continue
 		}
 
@@ -219,6 +265,13 @@ func Acquire(ctx context.Context, opts Options) (*Result, error) {
 	result.BytesWritten = bytesWritten
 	result.BlocksWritten = blocksWritten
 	result.BlocksSkipped = blocksSkipped
+	if failures > 0 && failures == unmappedFailures && blocksWritten == 0 {
+		result.Success = false
+		return result, diagnostic.SourceError("physical acquisition source has no mapped requested ranges").
+			WithOperation("physical acquisition").
+			WithTarget(result.SourceName).
+			WithCause(fmt.Errorf("%d block(s) unmapped", failures))
+	}
 	if failures > 0 {
 		result.Success = false
 		return result, diagnostic.SourceError("physical acquisition incomplete").
@@ -235,6 +288,18 @@ func Acquire(ctx context.Context, opts Options) (*Result, error) {
 
 	result.Success = true
 	return result, nil
+}
+
+func canRetryWithNextSource(result *Result) bool {
+	if result == nil || result.BlocksWritten != 0 || len(result.Warnings) == 0 {
+		return false
+	}
+	for _, warning := range result.Warnings {
+		if warning == nil || !source.IsNotMapped(warning.Cause) {
+			return false
+		}
+	}
+	return true
 }
 
 // createSafeOutput creates the output file with safe permissions.

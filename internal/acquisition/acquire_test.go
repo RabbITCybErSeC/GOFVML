@@ -335,6 +335,65 @@ func TestAcquireAllReadFailuresReturnError(t *testing.T) {
 	}
 }
 
+func TestAcquireFallsBackAfterAutoKcoreUnmapped(t *testing.T) {
+	data := []byte{1, 2, 3, 4}
+	fake := source.NewFakeSource(data, 0x1000)
+	var output bufferWriteCloser
+
+	result, err := Acquire(context.Background(), Options{
+		OutputPath: "memory.lime",
+		Format:     "lime",
+		Ranges:     []phys.Range{{Start: 0x1000, End: 0x1004}},
+		Sources: []source.Source{
+			testSource{name: source.SourceKcore, reader: notMappedReader{}},
+			source.NewFakeSourceAdapter(fake),
+		},
+		Output: &output,
+	})
+	if err != nil {
+		t.Fatalf("Acquire error: %v", err)
+	}
+	if !result.Success {
+		t.Error("expected success")
+	}
+	if result.SourceName != "fake" {
+		t.Errorf("SourceName = %q, want fake", result.SourceName)
+	}
+	if result.BlocksWritten != 1 {
+		t.Errorf("BlocksWritten = %d, want 1", result.BlocksWritten)
+	}
+}
+
+func TestAcquireExplicitKcoreUnmappedDoesNotFallback(t *testing.T) {
+	data := []byte{1, 2, 3, 4}
+	fake := source.NewFakeSource(data, 0x1000)
+	var output bufferWriteCloser
+
+	result, err := Acquire(context.Background(), Options{
+		OutputPath: "memory.lime",
+		Format:     "lime",
+		SourceName: source.SourceKcore,
+		Ranges:     []phys.Range{{Start: 0x1000, End: 0x1004}},
+		Sources: []source.Source{
+			testSource{name: source.SourceKcore, reader: notMappedReader{}},
+			source.NewFakeSourceAdapter(fake),
+		},
+		Output: &output,
+	})
+	if err == nil {
+		t.Fatal("expected acquisition error")
+	}
+	if result == nil {
+		t.Fatal("expected partial result")
+	}
+	if result.Success {
+		t.Error("expected unsuccessful result")
+	}
+	if result.BlocksWritten != 0 {
+		t.Errorf("BlocksWritten = %d, want 0", result.BlocksWritten)
+	}
+}
+
 func TestAcquireAllWriteFailuresReturnError(t *testing.T) {
 	data := []byte{1, 2, 3, 4}
 	fake := source.NewFakeSource(data, 0x1000)
@@ -427,12 +486,27 @@ func (f failingReader) Close() error {
 	return nil
 }
 
+type notMappedReader struct{}
+
+func (n notMappedReader) ReadAt([]byte, uint64) (int, error) {
+	return 0, source.NewNotMappedError(0x1000, source.PathProcKcore)
+}
+
+func (n notMappedReader) Close() error {
+	return nil
+}
+
 type testSource struct {
+	name   string
 	reader source.Reader
 }
 
 func (t testSource) Info() source.Info {
-	return source.Info{Name: "test", Path: "test://source"}
+	name := t.name
+	if name == "" {
+		name = "test"
+	}
+	return source.Info{Name: name, Path: "test://source"}
 }
 
 func (t testSource) Check(context.Context) source.Availability {

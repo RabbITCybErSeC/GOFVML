@@ -3,12 +3,38 @@ package source
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
 	"github.com/RabbITCybErSeC/gofvml/internal/diagnostic"
 	"github.com/RabbITCybErSeC/gofvml/internal/phys"
 )
+
+// NotMappedError reports that a source cannot translate a physical address.
+type NotMappedError struct {
+	Address uint64
+	Source  string
+}
+
+// Error returns a human-readable not-mapped error.
+func (e *NotMappedError) Error() string {
+	if e.Source == "" {
+		return fmt.Sprintf("physical address 0x%x not mapped", e.Address)
+	}
+	return fmt.Sprintf("physical address 0x%x not mapped in %s", e.Address, e.Source)
+}
+
+// NewNotMappedError creates a typed physical-address translation error.
+func NewNotMappedError(address uint64, source string) error {
+	return &NotMappedError{Address: address, Source: source}
+}
+
+// IsNotMapped reports whether err wraps a NotMappedError.
+func IsNotMapped(err error) bool {
+	var target *NotMappedError
+	return errors.As(err, &target)
+}
 
 // Reader is the interface for reading physical memory from a source.
 type Reader interface {
@@ -108,10 +134,10 @@ func IsAllZeros(data []byte) bool {
 
 // Common source names and paths.
 const (
-	SourceCrash  = "crash"
-	SourceKcore  = "kcore"
-	SourceMem    = "mem"
-	PathDevCrash = "/dev/crash"
+	SourceCrash   = "crash"
+	SourceKcore   = "kcore"
+	SourceMem     = "mem"
+	PathDevCrash  = "/dev/crash"
 	PathProcKcore = "/proc/kcore"
 	PathDevMem    = "/dev/mem"
 )
