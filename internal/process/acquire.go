@@ -3,6 +3,7 @@ package process
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -52,6 +53,8 @@ type MappingResult struct {
 	BytesRead uint64
 	// Events records each read attempt.
 	Events []ReadEvent
+	// Blocks contains acquired payload chunks for this mapping.
+	Blocks []PayloadBlock
 }
 
 // ReadEvent records a single read attempt.
@@ -181,6 +184,12 @@ func readMapping(ctx context.Context, memFile *os.File, mapping procfs.Mapping, 
 
 		buf := make([]byte, size)
 		n, err := memFile.ReadAt(buf, int64(addr))
+		status := StatusOK
+		if err != nil {
+			status = StatusError
+		} else if n < int(size) {
+			status = StatusShortRead
+		}
 
 		mr.Events = append(mr.Events, ReadEvent{
 			VirtualAddress: addr,
@@ -190,6 +199,18 @@ func readMapping(ctx context.Context, memFile *os.File, mapping procfs.Mapping, 
 		})
 		if n > 0 {
 			mr.BytesRead += uint64(n)
+			mr.Blocks = append(mr.Blocks, PayloadBlock{
+				VirtualAddress:  addr,
+				CompressionType: CompressionNone,
+				Status:          status,
+				Data:            append([]byte(nil), buf[:n]...),
+			})
+		}
+		if err != nil {
+			return fmt.Errorf("read mapping chunk at 0x%x: %w", addr, err)
+		}
+		if n < int(size) {
+			return fmt.Errorf("short read mapping chunk at 0x%x: %w", addr, io.ErrUnexpectedEOF)
 		}
 
 		// Always advance by the full chunk size to avoid getting stuck

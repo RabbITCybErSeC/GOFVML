@@ -4,6 +4,10 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/RabbITCybErSeC/gofvml/internal/process"
+	"github.com/RabbITCybErSeC/gofvml/internal/procfs"
 )
 
 func TestCLI_Help(t *testing.T) {
@@ -12,12 +16,12 @@ func TestCLI_Help(t *testing.T) {
 	defer func() { os.Args = oldArgs }()
 
 	os.Args = []string{"gofvml"}
-	
+
 	// We can't easily test main() directly since it calls os.Exit.
 	// Instead, test the help output function indirectly.
 	var buf strings.Builder
 	printUsageTo(&buf)
-	
+
 	output := buf.String()
 	if !strings.Contains(output, "gofvml - Linux volatile memory acquisition tool") {
 		t.Error("expected help text to contain tool name")
@@ -35,7 +39,7 @@ func TestCLI_Physical_MissingOutput(t *testing.T) {
 	defer func() { os.Args = oldArgs }()
 
 	os.Args = []string{"gofvml", "physical"}
-	
+
 	// Should exit with error; we can't capture os.Exit easily in tests.
 	// Just verify the flag set is configured correctly by parsing manually.
 }
@@ -46,6 +50,39 @@ func TestCLI_Process_MissingPID(t *testing.T) {
 
 	os.Args = []string{"gofvml", "process", "-output", "/tmp/test.art"}
 	// Should require PID.
+}
+
+func TestBuildProcessArtifactUsesAcquiredPayloadBlocks(t *testing.T) {
+	result := &process.Result{
+		PID:       123,
+		BytesRead: 5,
+		Mappings: []process.MappingResult{
+			{
+				Mapping: procfs.Mapping{Start: 0x1000, End: 0x1005, Perms: "r--p"},
+				Events:  []process.ReadEvent{{VirtualAddress: 0x1000, Requested: 5, Read: 5}},
+				Blocks: []process.PayloadBlock{
+					{
+						VirtualAddress:  0x1000,
+						MappingIndex:    0,
+						CompressionType: process.CompressionNone,
+						Status:          process.StatusOK,
+						Data:            []byte("hello"),
+					},
+				},
+			},
+		},
+	}
+
+	meta, blocks := buildProcessArtifact(result, false, time.Unix(10, 0).UTC())
+	if meta.PID != 123 || meta.BytesRead != 5 {
+		t.Fatalf("unexpected metadata: %+v", meta)
+	}
+	if len(blocks) != 1 {
+		t.Fatalf("blocks = %d, want 1", len(blocks))
+	}
+	if string(blocks[0].Data) != "hello" {
+		t.Fatalf("artifact block data = %q, want acquired payload", blocks[0].Data)
+	}
 }
 
 func printUsageTo(w *strings.Builder) {

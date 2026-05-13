@@ -1,6 +1,7 @@
 package process
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"runtime"
@@ -210,6 +211,74 @@ func TestReadEventHelpers(t *testing.T) {
 	}
 	if e3.IsShortRead() {
 		t.Error("expected not short read when error")
+	}
+}
+
+func TestReadMappingCapturesPayloadBlocks(t *testing.T) {
+	tmp := t.TempDir()
+	path := tmp + "/mem"
+	data := []byte("abcdefghijkl")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	mapping := procfs.Mapping{Start: 0, End: uint64(len(data)), Perms: "r--p"}
+	var mr MappingResult
+	err = readMapping(context.Background(), f, mapping, 5, &mr)
+	if err != nil {
+		t.Fatalf("readMapping error: %v", err)
+	}
+
+	if got, want := len(mr.Blocks), 3; got != want {
+		t.Fatalf("blocks = %d, want %d", got, want)
+	}
+	if got := append(append([]byte{}, mr.Blocks[0].Data...), append(mr.Blocks[1].Data, mr.Blocks[2].Data...)...); !bytes.Equal(got, data) {
+		t.Fatalf("payload blocks reconstruct %q, want %q", got, data)
+	}
+	if mr.Blocks[0].VirtualAddress != 0 || mr.Blocks[1].VirtualAddress != 5 || mr.Blocks[2].VirtualAddress != 10 {
+		t.Fatalf("unexpected block virtual addresses: %#v", mr.Blocks)
+	}
+}
+
+func TestReadMappingReturnsErrorOnFailedChunk(t *testing.T) {
+	tmp := t.TempDir()
+	path := tmp + "/short-mem"
+	if err := os.WriteFile(path, []byte("abc"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	mapping := procfs.Mapping{Start: 0, End: 8, Perms: "r--p"}
+	var mr MappingResult
+	err = readMapping(context.Background(), f, mapping, 8, &mr)
+	if err == nil {
+		t.Fatal("expected readMapping error for incomplete mapping read")
+	}
+	if len(mr.Events) != 1 {
+		t.Fatalf("events = %d, want 1", len(mr.Events))
+	}
+	if !mr.Events[0].IsError() {
+		t.Fatalf("expected read event to record error: %+v", mr.Events[0])
+	}
+	if len(mr.Blocks) != 1 {
+		t.Fatalf("blocks = %d, want partial payload block", len(mr.Blocks))
+	}
+	if got, want := mr.Blocks[0].Data, []byte("abc"); !bytes.Equal(got, want) {
+		t.Fatalf("partial block data = %q, want %q", got, want)
+	}
+	if mr.Blocks[0].Status != StatusError {
+		t.Fatalf("partial block status = %d, want StatusError", mr.Blocks[0].Status)
 	}
 }
 

@@ -209,28 +209,7 @@ func runProcess(args []string) int {
 	}
 	defer artifactFile.Close()
 
-	// Build artifact metadata and blocks from result.
-	meta := process.ArtifactMetadata{
-		PID:        result.PID,
-		Timestamp:  time.Now(),
-		Strict:     *strict,
-		BytesRead:  result.BytesRead,
-		Mappings:   make([]procfs.Mapping, 0, len(result.Mappings)),
-		ReadEvents: make([]process.ReadEvent, 0),
-	}
-
-	var blocks []process.PayloadBlock
-	for _, m := range result.Mappings {
-		meta.Mappings = append(meta.Mappings, m.Mapping)
-		meta.ReadEvents = append(meta.ReadEvents, m.Events...)
-		// Create a placeholder block for each mapping.
-		blocks = append(blocks, process.PayloadBlock{
-			VirtualAddress:  m.Mapping.Start,
-			MappingIndex:    uint32(len(meta.Mappings) - 1),
-			CompressionType: process.CompressionNone,
-			Status:          process.StatusOK,
-		})
-	}
+	meta, blocks := buildProcessArtifact(result, *strict, time.Now())
 
 	if err := process.WriteArtifact(artifactFile, blocks, meta); err != nil {
 		fmt.Fprintf(os.Stderr, "Error writing artifact: %v\n", err)
@@ -246,4 +225,27 @@ func runProcess(args []string) int {
 	cli.RenderDiagnostics(os.Stdout, result.Warnings)
 
 	return 0
+}
+
+func buildProcessArtifact(result *process.Result, strict bool, timestamp time.Time) (process.ArtifactMetadata, []process.PayloadBlock) {
+	meta := process.ArtifactMetadata{
+		PID:        result.PID,
+		Timestamp:  timestamp,
+		Strict:     strict,
+		BytesRead:  result.BytesRead,
+		Mappings:   make([]procfs.Mapping, 0, len(result.Mappings)),
+		ReadEvents: make([]process.ReadEvent, 0),
+	}
+
+	var blocks []process.PayloadBlock
+	for i, m := range result.Mappings {
+		meta.Mappings = append(meta.Mappings, m.Mapping)
+		meta.ReadEvents = append(meta.ReadEvents, m.Events...)
+		for _, block := range m.Blocks {
+			block.MappingIndex = uint32(i)
+			blocks = append(blocks, block)
+		}
+	}
+
+	return meta, blocks
 }

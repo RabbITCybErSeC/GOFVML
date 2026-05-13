@@ -15,7 +15,7 @@ import (
 
 func TestUpload_Success(t *testing.T) {
 	content := []byte("test upload content")
-	
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
 			t.Errorf("expected PUT, got %s", r.Method)
@@ -110,7 +110,9 @@ func TestUpload_DeleteAfterSuccess(t *testing.T) {
 }
 
 func TestUpload_PreserveAfterFailure(t *testing.T) {
+	attempts := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer server.Close()
@@ -136,6 +138,9 @@ func TestUpload_PreserveAfterFailure(t *testing.T) {
 
 	if _, err := os.Stat(filePath); err != nil {
 		t.Errorf("expected file to be preserved: %v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 when Retries is zero", attempts)
 	}
 }
 
@@ -207,9 +212,9 @@ func TestUpload_Retry(t *testing.T) {
 	}
 
 	opts := Options{
-		FilePath: filePath,
-		URL:      server.URL + "/upload",
-		Retries:  3,
+		FilePath:   filePath,
+		URL:        server.URL + "/upload",
+		Retries:    3,
 		HTTPClient: &http.Client{Timeout: 5 * time.Second},
 	}
 
@@ -245,9 +250,9 @@ func TestUpload_Cancellation(t *testing.T) {
 	defer cancel()
 
 	opts := Options{
-		FilePath: filePath,
-		URL:      server.URL + "/upload",
-		Retries:  0,
+		FilePath:   filePath,
+		URL:        server.URL + "/upload",
+		Retries:    0,
 		HTTPClient: &http.Client{Timeout: 30 * time.Second},
 	}
 

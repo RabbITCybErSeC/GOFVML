@@ -23,7 +23,7 @@ type Options struct {
 	DeleteAfter bool
 	// Progress is an optional progress callback.
 	Progress progress.Callback
-	// Retries is the number of retry attempts for transient failures.
+	// Retries is the number of retry attempts after the initial upload attempt.
 	Retries int
 	// HTTPClient overrides the default HTTP client. If nil, a default client
 	// with 30-second timeout is used.
@@ -50,8 +50,8 @@ func (r *Result) AddWarning(w *diagnostic.Diagnostic) {
 // Upload uploads a local file to the given URL via HTTP PUT.
 // It preserves the local file on failure or cancellation.
 func Upload(ctx context.Context, opts Options) (*Result, error) {
-	if opts.Retries <= 0 {
-		opts.Retries = 3
+	if opts.Retries < 0 {
+		opts.Retries = 0
 	}
 
 	result := &Result{URL: opts.URL}
