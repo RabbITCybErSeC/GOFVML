@@ -1,3 +1,37 @@
+# Build outputs
+/gofvml
+/gofvml-convert
+/gofvml-upload
+*.exe
+
+# Go build artifacts
+/vendor/
+
+# Test artifacts
+*.test
+*.out
+coverage.html
+coverage.txt
+
+# Temporary memory images
+*.lime
+*.avml
+*.raw
+*.gofvml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local validation output
+/validation-output/
 
 # Beads / Dolt files (added by bd init)
 .dolt/
